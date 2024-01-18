@@ -1,0 +1,14 @@
+services:
+  app1_container:
+    image: adityap27/csci-5409-a1-app1
+    ports:
+      - "6000:6000"
+    volumes:
+      - ./:/app/files
+
+  app2_container:
+    image: adityap27/csci-5409-a1-app2
+    ports:
+      - "7000:7000"
+    volumes:
+      - ./:/app/files
