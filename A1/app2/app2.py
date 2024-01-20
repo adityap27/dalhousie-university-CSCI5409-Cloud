@@ -20,7 +20,7 @@ def sum():
     with open("./files/"+request.json["file"]) as csvfile:
         csv_reader = csv.reader(csvfile, delimiter=',')
         for row in csv_reader:
-            if len(row) is not 2:
+            if len(row) != 2:
                 return { 
                         "file": request.json["file"], 
                         "error": "Input file not in CSV format." 

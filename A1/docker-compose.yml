@@ -1,5 +1,6 @@
 services:
   app1_container:
+    build: ./app1
     image: adityap27/csci-5409-a1-app1
     ports:
       - "6000:6000"
@@ -7,6 +8,7 @@ services:
       - ./:/app/files
 
   app2_container:
+    build: ./app2
     image: adityap27/csci-5409-a1-app2
     ports:
       - "7000:7000"
