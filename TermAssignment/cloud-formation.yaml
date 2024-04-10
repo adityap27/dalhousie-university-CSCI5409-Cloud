@@ -1,0 +1,579 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: "CloudFormation Template for SubtitleBuddy Project - create subtitles for your video."
+
+Parameters:
+  InputS3BucketName:
+    Type: String
+    Default: subtitle-generator-input-s3bucket
+    Description: Enter name of S3 Bucket for storing input video files. Default is subtitle-generator-input-s3-bucket.
+
+  FrontendSourceCodeS3BucketName:
+    Type: String
+    Default: subtitle-generator-source-code-for-cloudformation
+    Description: Enter name of S3 Bucket which contains the source code of frontend(.zip). This will be used by Elastic Beanstalk.
+
+  FrontendSourceCodeS3KeyName:
+    Type: String
+    Default: subtitle-generator-frontend.zip
+    Description: Enter name of S3 Object Key of the source code of frontend(.zip). This will be used by Elastic Beanstalk.
+
+  SenderEmail:
+    Type: String
+    Default: adityapurohit27@gmail.com
+    Description: Enter email from which you want to send emails to users for .srt files. This email will be verified, as it will be registered in AWS SES.
+
+Resources:
+  GenerateS3PresignedURLFunctionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - "sts:AssumeRole"
+      Policies:
+      - PolicyName: root
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Effect: Allow
+            Action: ["ses:CreateEmailIdentity", "ses:GetEmailIdentity"]
+            Resource: !Sub "arn:aws:ses:${AWS::Region}:${AWS::AccountId}:identity/*"
+          - Effect: Allow
+            Action: ["s3:PutObject", "s3:PutObjectTagging"]
+            Resource: !Sub "arn:aws:s3:::${InputS3BucketName}/*"
+          - Effect: Allow
+            Action: "logs:CreateLogGroup"
+            Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+          - Effect: Allow
+            Action: ["logs:CreateLogStream", "logs:PutLogEvents"]
+            Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+
+  GenerateS3PresignedURLFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: nodejs18.x
+      Role: !GetAtt GenerateS3PresignedURLFunctionRole.Arn
+      Handler: index.handler
+      Environment:
+        Variables:
+          INPUT_BUCKET_NAME: !Ref InputS3BucketName
+      Code:
+        ZipFile: |
+          const { S3Client, PutObjectCommand } = require("@aws-sdk/client-s3");
+          const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
+          const {
+            SESv2Client,
+            CreateEmailIdentityCommand,
+            GetEmailIdentityCommand,
+          } = require("@aws-sdk/client-sesv2");
+
+          exports.handler = async function(event) {
+            // Extract the input file name and email of the user.
+            const body = JSON.parse(event.body);
+            const fileName = body.fileName;
+            const email = body.email;
+
+            // Check if the email identity already exists in AWS SES
+            const sesClient = new SESv2Client();
+            const identityParams = { EmailIdentity: email };
+            const getEmailIdentityCommand = new GetEmailIdentityCommand(identityParams);
+            let emailIdentityResponse;
+            try {
+              emailIdentityResponse = await sesClient.send(getEmailIdentityCommand);
+            } catch (error) {
+              // If the email identity doesn"t exist, create it and send verification email
+              if (error.name === "NotFoundException") {
+                const createEmailIdentityParams = { EmailIdentity: email };
+                const createEmailIdentityCommand = new CreateEmailIdentityCommand(
+                  createEmailIdentityParams
+                );
+                await sesClient.send(createEmailIdentityCommand);
+                console.log("Verification email sent to", email);
+
+                return {
+                  statusCode: 200,
+                  body: JSON.stringify({
+                    preSignedURL: null,
+                    isEmailVerified: false,
+                  }),
+                  headers: {
+                    "Access-Control-Allow-Headers": "Content-Type",
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Methods": "OPTIONS,POST",
+                  },
+                };
+              } else {
+                throw error;
+              }
+            }
+
+            // If email identity is created but not successfully verified, don't send preSignedURL, let user verify first.
+            if (emailIdentityResponse.VerificationStatus !== "SUCCESS") {
+              console.log("Email", email, "verification is not successful yet.");
+              return {
+                statusCode: 200,
+                body: JSON.stringify({
+                  preSignedURL: null,
+                  isEmailVerified: false,
+                }),
+                headers: {
+                  "Access-Control-Allow-Headers": "Content-Type",
+                  "Access-Control-Allow-Origin": "*",
+                  "Access-Control-Allow-Methods": "OPTIONS,POST",
+                },
+              };
+            }
+
+            console.log("Email", email, "is already verified.");
+
+            // Create a Pre-signed URL for the S3 Object with given file name and email as a tag
+            const s3Client = new S3Client();
+            const s3Command = new PutObjectCommand({
+              Bucket: process.env.INPUT_BUCKET_NAME,
+              Key: fileName,
+              Tagging: `email=${email}`,
+            });
+            const s3Response = await getSignedUrl(s3Client, s3Command, {
+              expiresIn: 3600,
+              unhoistableHeaders: new Set(["x-amz-tagging"]),
+            });
+            console.log("S3 Response", s3Response);
+
+            // Send the Pre-signed URL to frontend, so that user can directly upload to S3
+            return {
+              statusCode: 200,
+              body: JSON.stringify({
+                preSignedURL: s3Response,
+                isEmailVerified: true,
+              }),
+              headers: {
+                "Access-Control-Allow-Headers": "Content-Type",
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "OPTIONS,POST",
+              },
+            };
+          };
+      Description: "Generates a pre-signed URL for an S3 object, associating it with an email tag. Additionally, registers the email in SES due to sandbox restrictions for the recipient."
+
+  CreateTranscriptionJobFunctionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - "sts:AssumeRole"
+      Policies:
+      - PolicyName: root
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Effect: Allow
+            Action: ["transcribe:StartTranscriptionJob", "transcribe:TagResource"]
+            Resource: "*"
+          - Effect: Allow
+            Action: ["s3:GetObject", "s3:GetObjectTagging"]
+            Resource: !Sub "arn:aws:s3:::${InputS3BucketName}/*"
+          - Effect: Allow
+            Action: "logs:CreateLogGroup"
+            Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+          - Effect: Allow
+            Action: ["logs:CreateLogStream", "logs:PutLogEvents"]
+            Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+
+  CreateTranscriptionJobFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: nodejs18.x
+      Role: !GetAtt CreateTranscriptionJobFunctionRole.Arn
+      Handler: index.handler
+      Code:
+        ZipFile: |
+          const { TranscribeClient, StartTranscriptionJobCommand } = require("@aws-sdk/client-transcribe");
+          const { S3Client, GetObjectTaggingCommand } = require("@aws-sdk/client-s3");
+          const { randomUUID } = require("crypto");
+
+          exports.handler = async function(event, context) {
+            // Get the S3 URI of the object uploaded in the bucket.
+            const s3BucketName = event["Records"][0]["s3"]["bucket"]["name"];
+            const s3ObjectKey = event["Records"][0]["s3"]["object"]["key"];
+            const s3InputObjectUri = `s3://${s3BucketName}/${s3ObjectKey}`;
+            console.log("Input: ", s3InputObjectUri);
+
+            // Retrieve email tag from the S3 object.
+            const s3Client = new S3Client();
+            const s3TagInput = {
+              Bucket: s3BucketName,
+              Key: s3ObjectKey,
+            };
+
+            const s3TagResponse = await s3Client.send(
+              new GetObjectTaggingCommand(s3TagInput)
+            );
+            const emailTag = s3TagResponse.TagSet.find((tag) => tag.Key === "email");
+
+            // Create a Transcription Job with the email as tag.
+            const transcribeClient = new TranscribeClient();
+            const transcribeInput = {
+              TranscriptionJobName: s3ObjectKey + "_" + randomUUID(),
+              IdentifyMultipleLanguages: true,
+              LanguageOptions: [ "en-US", "fr-CA"], // same media file can contain english + french combined.
+              Media: {
+                MediaFileUri: s3InputObjectUri,
+              },
+              Subtitles: {
+                Formats: ["srt"],
+                OutputStartIndex: 1,
+              },
+              Tags: [
+                {
+                  Key: "email",
+                  Value: emailTag.Value,
+                },
+              ],
+            };
+            const transcribeCommand = new StartTranscriptionJobCommand(transcribeInput);
+            const transcribeResponse = await transcribeClient.send(transcribeCommand);
+
+            console.log("TranscribeClient response: ", transcribeResponse);
+            return transcribeResponse;
+          };
+      Description: "Creates a transcription job based on the S3 Object(i.e. video file) uploaded by the frontend. It is triggered by S3, when object upload is uploaded."
+
+  SendEmailWithSubtitlesFunctionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - "sts:AssumeRole"
+      Policies:
+      - PolicyName: root
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Effect: Allow
+            Action: ["transcribe:GetTranscriptionJob"]
+            Resource: !Sub "arn:aws:transcribe:${AWS::Region}:${AWS::AccountId}:transcription-job/*"
+          - Effect: Allow
+            Action: ["ses:SendEmail"]
+            Resource: !Sub "arn:aws:ses:${AWS::Region}:${AWS::AccountId}:identity/*"
+          - Effect: Allow
+            Action: "logs:CreateLogGroup"
+            Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+          - Effect: Allow
+            Action: ["logs:CreateLogStream", "logs:PutLogEvents"]
+            Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+
+  SendEmailWithSubtitlesFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: nodejs18.x
+      Role: !GetAtt SendEmailWithSubtitlesFunctionRole.Arn
+      Handler: index.handler
+      Environment:
+        Variables:
+          SES_SENDER: !Ref SenderEmail
+      Code:
+        ZipFile: |
+          const { SESClient, SendEmailCommand } = require("@aws-sdk/client-ses");
+          const {
+            TranscribeClient,
+            GetTranscriptionJobCommand,
+          } = require("@aws-sdk/client-transcribe");
+
+          exports.handler = async (event, context) => {
+            // Fetch the completed TranscriptionJob.
+            const transcribeClient = new TranscribeClient();
+            const transcribeInput = {
+              TranscriptionJobName: event.detail.TranscriptionJobName,
+            };
+            const transcribeCommand = new GetTranscriptionJobCommand(transcribeInput);
+            const transcribeResponse = await transcribeClient.send(transcribeCommand);
+
+            // Extract subtitle URL, media file name and email from transcribeResponse.
+            const subtitleUrl =
+              transcribeResponse.TranscriptionJob.Subtitles.SubtitleFileUris[0];
+            const mediaFileName =
+              transcribeResponse.TranscriptionJob.Media.MediaFileUri.split("/").pop();
+            const emailTag = transcribeResponse.TranscriptionJob.Tags.find(
+              (tag) => tag.Key === "email"
+            );
+
+            // Create HTML message with subtitle URL and media file name.
+            const subject = `Subtitles Generated - ${mediaFileName}`;
+            const htmlBody = `<p><b>File Name</b>: ${mediaFileName}</p>
+                            <p><b>Subtitle URL</b>: <a href="${subtitleUrl}">Download Subtitles.</a></p>`;
+
+            // Send the email to user with .srt file URL and input media file name.
+            const sesClient = new SESClient();
+            const sesCommand = new SendEmailCommand({
+              Source: process.env.SES_SENDER,
+              Destination: {
+                ToAddresses: [emailTag.Value],
+              },
+              Message: {
+                Subject: {
+                  Data: subject,
+                },
+                Body: {
+                  Html: {
+                    Data: htmlBody,
+                  },
+                },
+              },
+            });
+            const sesResponse = await sesClient.send(sesCommand);
+
+            console.log("SESClient response: ", sesResponse);
+
+            return sesResponse;
+          };
+      Description: "Sends .srt file to the user in Email using SES. It is triggered by EventBridge, once transcription job is completed."
+
+  InputS3Bucket:
+    Type: "AWS::S3::Bucket"
+    DependsOn:
+    - "PermissionForS3ToInvokeLambda"
+    Properties:
+      BucketName: !Ref InputS3BucketName
+      CorsConfiguration:
+        CorsRules:
+        - AllowedHeaders:
+          - "*"
+          AllowedMethods:
+          - PUT
+          AllowedOrigins:
+          - "*"
+          Id: myCORSRuleId1
+          MaxAge: 3600
+      NotificationConfiguration:
+        LambdaConfigurations:
+        - Event: 's3:ObjectCreated:Put'
+          Function: !GetAtt CreateTranscriptionJobFunction.Arn
+
+  PermissionForS3ToInvokeLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CreateTranscriptionJobFunction
+      Action: "lambda:InvokeFunction"
+      Principal: "s3.amazonaws.com"
+      SourceArn: !Sub "arn:aws:s3:::${InputS3BucketName}"
+
+  SESSenderEmailIdentity:
+    Type: AWS::SES::EmailIdentity
+    Properties:
+      EmailIdentity: !Ref SenderEmail
+
+  TranscribeToLambdaEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventBusName: default
+      EventPattern:
+        source:
+        - aws.transcribe
+        detail-type:
+        - Transcribe Job State Change
+        detail:
+          TranscriptionJobStatus:
+          - COMPLETED
+      State: ENABLED
+      Targets:
+      - Id: "SendEmailLambdaTarget"
+        Arn: !GetAtt SendEmailWithSubtitlesFunction.Arn
+
+  PermissionForEventsToInvokeLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SendEmailWithSubtitlesFunction
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt TranscribeToLambdaEventRule.Arn
+
+  GenerateS3PresignedURLLambdaRestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: GenerateS3PresignedURLLambdaRestApi
+      Description: "This REST API is used to expose Lambda function."
+      EndpointConfiguration:
+        Types:
+        - REGIONAL
+
+  UploadResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref GenerateS3PresignedURLLambdaRestApi
+      ParentId: !GetAtt
+      - GenerateS3PresignedURLLambdaRestApi
+      - RootResourceId
+      PathPart: upload
+
+  UploadResourcePOST:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref GenerateS3PresignedURLLambdaRestApi
+      ResourceId: !Ref UploadResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub >-
+          arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GenerateS3PresignedURLFunction.Arn}/invocations
+
+  UploadResourceOPTIONS:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref GenerateS3PresignedURLLambdaRestApi
+      ResourceId: !Ref UploadResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: "'*'"
+            method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+          ResponseTemplates:
+            application/json: ''
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+      - StatusCode: 200
+        ResponseModels:
+          application/json: 'Empty'
+        ResponseParameters:
+          method.response.header.Access-Control-Allow-Headers: true
+          method.response.header.Access-Control-Allow-Methods: true
+          method.response.header.Access-Control-Allow-Origin: true
+
+  Deployment:
+    Type: 'AWS::ApiGateway::Deployment'
+    DependsOn:
+    - UploadResourcePOST
+    - UploadResourceOPTIONS
+    Properties:
+      RestApiId: !Ref GenerateS3PresignedURLLambdaRestApi
+      Description: Prod Deployment
+
+  Prod:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      StageName: prod
+      Description: Prod Stage
+      RestApiId: !Ref GenerateS3PresignedURLLambdaRestApi
+      DeploymentId: !Ref Deployment
+
+  PermissionForAPIGatewayToInvokeLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref GenerateS3PresignedURLFunction
+      Action: "lambda:InvokeFunction"
+      Principal: "apigateway.amazonaws.com"
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${GenerateS3PresignedURLLambdaRestApi}/*/POST/upload"
+
+  ElasticBeanStalkApplication:
+    Type: AWS::ElasticBeanstalk::Application
+    Properties:
+      ApplicationName: "SubtitleGeneratorFrontend"
+      Description: "Subtitle Generator Frontend - React & Docker"
+
+  EBAppVersion1:
+    Type: AWS::ElasticBeanstalk::ApplicationVersion
+    Properties:
+      ApplicationName: !Ref ElasticBeanStalkApplication
+      Description: "Frontend Version 1"
+      SourceBundle:
+        S3Bucket: !Ref FrontendSourceCodeS3BucketName
+        S3Key: !Ref FrontendSourceCodeS3KeyName
+
+  EBEnvironment:
+    Type: AWS::ElasticBeanstalk::Environment
+    Properties:
+      ApplicationName: !Ref ElasticBeanStalkApplication
+      Description: "AWS Elastic Beanstalk Environment running Dockerized React frontend."
+      EnvironmentName: prod
+      CNAMEPrefix: SubtitleGenerator
+      SolutionStackName: "64bit Amazon Linux 2023 v4.3.0 running Docker"
+      VersionLabel: !Ref EBAppVersion1
+      OptionSettings:
+      - Namespace: 'aws:elasticbeanstalk:environment'
+        OptionName: EnvironmentType
+        Value: SingleInstance
+      - Namespace: 'aws:autoscaling:launchconfiguration'
+        OptionName: IamInstanceProfile
+        Value: !Ref EBInstanceProfile
+      - Namespace: 'aws:elasticbeanstalk:environment'
+        OptionName: ServiceRole
+        Value: !Ref EBServiceRole
+      - Namespace: 'aws:ec2:instances'
+        OptionName: InstanceTypes
+        Value: t3.medium
+      - Namespace: 'aws:elasticbeanstalk:application:environment'
+        OptionName: REACT_APP_API_GATEWAY_URL
+        Value: !Sub "https://${GenerateS3PresignedURLLambdaRestApi}.execute-api.${AWS::Region}.amazonaws.com/${Prod}/upload"
+
+  EBServiceRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - elasticbeanstalk.amazonaws.com
+          Action:
+          - "sts:AssumeRole"
+      ManagedPolicyArns:
+      - "arn:aws:iam::aws:policy/service-role/AWSElasticBeanstalkEnhancedHealth"
+      - "arn:aws:iam::aws:policy/AWSElasticBeanstalkManagedUpdatesCustomerRolePolicy"
+
+  EBInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+      - !Ref EBInstanceProfileRole
+
+  EBInstanceProfileRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - ec2.amazonaws.com
+          Action:
+          - "sts:AssumeRole"
+      ManagedPolicyArns:
+      - "arn:aws:iam::aws:policy/AWSElasticBeanstalkWebTier"
+
+
+Outputs:
+  POSTUploadAPIGatewayURL:
+    Description: API Gateway URL for POST /upload
+    Value: !Sub "https://${GenerateS3PresignedURLLambdaRestApi}.execute-api.${AWS::Region}.amazonaws.com/${Prod}/upload"
+
+  BeanstalkFrontendURL:
+    Description: Frontend URL provided by AWS Elastic Beanstalk
+    Value: !Sub "http://SubtitleGenerator.${AWS::Region}.elasticbeanstalk.com"

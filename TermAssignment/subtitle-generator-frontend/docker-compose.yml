@@ -1,0 +1,6 @@
+services:
+  frontend_container:
+    build: .
+    image: subtitle_generator_react
+    ports:
+      - "80:3000"
